@@ -109,6 +109,63 @@ def diarize_file_path(file_path: str) -> DiarizationResponse:
 
     return DiarizationResponse(turns=turns, model="pyannote/speaker-diarization-3.1")
 
+
+# ---------------- Speaker-attributed transcription (Combine) ----------------
+class SpeakerSegment(BaseModel):
+    start: float
+    end: float
+    speaker: str
+    text: str
+
+
+class SpeakerTranscriptResponse(BaseModel):
+    segments: List[SpeakerSegment]
+    full_text: str
+    asr_model: str
+    diarization_model: str
+
+
+def _assign_speakers_to_whisper_segments(
+    whisper_segments: List[dict], diarization_turns: List[DiarizationTurn]
+) -> List[SpeakerSegment]:
+    assigned: List[SpeakerSegment] = []
+    for seg in whisper_segments:
+        ws = float(seg.get("start", 0.0))
+        we = float(seg.get("end", 0.0))
+        text = (seg.get("text") or "").strip()
+        best_speaker = "SPEAKER_00"
+        best_overlap = 0.0
+        for turn in diarization_turns:
+            ts, te = turn.start, turn.end
+            overlap = max(0.0, min(we, te) - max(ws, ts))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = turn.speaker
+        assigned.append(
+            SpeakerSegment(start=ws, end=we, speaker=best_speaker, text=text)
+        )
+    return assigned
+
+
+def transcribe_diarize_file_path(file_path: str) -> SpeakerTranscriptResponse:
+    model = get_whisper_model()
+    asr_result = model.transcribe(file_path)
+    whisper_segments: List[dict] = asr_result.get("segments") or []
+
+    diar_response = diarize_file_path(file_path)
+
+    speaker_segments = _assign_speakers_to_whisper_segments(
+        whisper_segments, diar_response.turns
+    )
+    full_text = (asr_result.get("text") or "").strip()
+
+    return SpeakerTranscriptResponse(
+        segments=speaker_segments,
+        full_text=full_text,
+        asr_model=_whisper_model_name,
+        diarization_model="pyannote/speaker-diarization-3.1",
+    )
+
 # For local mp3 files
 def transcribe_file_path(file_path: str) -> TranscriptionResponse:
     if not os.path.exists(file_path):
@@ -231,6 +288,44 @@ class DiarizationRequest(BaseModel):
 @app.post("/v1/diarize-path", response_model=DiarizationResponse)
 async def diarize_from_path(request: DiarizationRequest):
     return diarize_file_path(request.file_path)
+
+
+@app.post("/v1/transcribe-diarize", response_model=SpeakerTranscriptResponse)
+async def transcribe_diarize(
+    file: UploadFile = File(..., description="Audio file to transcribe and diarize")
+):
+    if not file.content_type or not any(
+        x in file.content_type for x in ("audio", "video", "octet-stream")
+    ):
+        raise HTTPException(status_code=400, detail="Unsupported file type")
+
+    try:
+        suffix = os.path.splitext(file.filename or "upload")[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            file_bytes = await file.read()
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        response = transcribe_diarize_file_path(tmp_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        try:
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return response
+
+
+class TranscribeDiarizeRequest(BaseModel):
+    file_path: str
+
+
+@app.post("/v1/transcribe-diarize-path", response_model=SpeakerTranscriptResponse)
+async def transcribe_diarize_path(request: TranscribeDiarizeRequest):
+    return transcribe_diarize_file_path(request.file_path)
 
 if __name__ == "__main__":
     import uvicorn
