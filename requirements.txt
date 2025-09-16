@@ -5,3 +5,7 @@ openai-whisper
 torch
 numpy
 pydantic
+pyannote.audio
+torchmetrics
+librosa
+soundfile
