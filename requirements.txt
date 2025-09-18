@@ -9,3 +9,4 @@ pyannote.audio
 torchmetrics
 librosa
 soundfile
+google-genai
