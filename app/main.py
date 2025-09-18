@@ -48,7 +48,7 @@ def get_whisper_model():
 
 # ---------------------- Diarization (pyannote) ----------------------
 _diarization_pipeline = None
-_hf_token = ""
+_hf_token = os.getenv("HUGGINGFACE_TOKEN", "")
 
 
 class DiarizationTurn(BaseModel):
@@ -124,6 +124,15 @@ class SpeakerTranscriptResponse(BaseModel):
     asr_model: str
     diarization_model: str
 
+
+# ---------------- Summarization (Gemini) ----------------
+class MeetingSummaryResponse(BaseModel):
+    overall_summary: str
+    key_points: List[str]
+    action_items: List[str]
+    decisions: List[str]
+    total_duration: float
+    speakers: List[str]
 
 def _assign_speakers_to_whisper_segments(
     whisper_segments: List[dict], diarization_turns: List[DiarizationTurn]
@@ -318,6 +327,137 @@ async def transcribe_diarize(
 
     return response
 
+_gemini_client = None
+_gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+def get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        try:
+            from google import genai
+            from google.genai import types
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to import google.genai. Ensure 'google-genai' is installed."
+            ) from exc
+        
+        if not _gemini_api_key:
+            raise RuntimeError(
+                "Missing GEMINI_API_KEY environment variable."
+            )
+        
+        _gemini_client = genai.Client(api_key=_gemini_api_key)
+    return _gemini_client
+
+def _format_transcript_for_summarization(segments: List[SpeakerSegment]) -> str:
+    """Format speaker segments into readable transcript"""
+    lines = []
+    for segment in segments:
+        speaker = segment.speaker
+        text = segment.text.strip()
+        if text:
+            lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
+
+
+def _summarize_with_gemini(transcript: str) -> MeetingSummaryResponse:
+    """Summarize the full transcript using Gemini"""
+    try:
+        client = get_gemini_client()
+        
+        prompt = f"""
+        Analyze this meeting transcript and respond with ONLY a valid JSON object. Do not include any other text before or after the JSON.
+
+        Required JSON format:
+        {{
+            "overall_summary": "Brief 2-3 sentence summary of the meeting",
+            "key_points": ["key point 1", "key point 2", "key point 3"],
+            "action_items": ["action item 1", "action item 2"],
+            "decisions": ["decision 1", "decision 2"]
+        }}
+
+        Meeting transcript:
+        {transcript}
+        """
+        
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[prompt],
+            config={
+                "temperature": 0.3,
+                "max_output_tokens": 2000,
+            }
+        )
+        import json
+        response_text = response.text.strip()
+        if not response_text:
+            raise ValueError("Empty response from Gemini")
+        
+        try:
+            if response_text.startswith('```json'):
+                end_marker = response_text.find('```', 7)
+                if end_marker != -1:
+                    response_text = response_text[7:end_marker].strip()
+            elif response_text.startswith('```'):
+                end_marker = response_text.find('```', 3)
+                if end_marker != -1:
+                    response_text = response_text[3:end_marker].strip()
+            
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}') + 1
+            
+            if start_idx == -1 or end_idx == 0:
+                raise ValueError("No JSON object found in response")
+            
+            json_text = response_text[start_idx:end_idx]
+            result = json.loads(json_text)
+        except json.JSONDecodeError as json_err:
+            print(f"JSON parsing failed: {json_err}")
+            print(f"Response text: {response_text[:500]}...")
+            result = {
+                "overall_summary": response_text[:200] + "..." if len(response_text) > 200 else response_text,
+                "key_points": [],
+                "action_items": [],
+                "decisions": []
+            }
+        
+        return MeetingSummaryResponse(
+            overall_summary=result.get("overall_summary", ""),
+            key_points=result.get("key_points", []),
+            action_items=result.get("action_items", []),
+            decisions=result.get("decisions", []),
+            total_duration=0.0,  
+            speakers=[] 
+        )
+        
+    except Exception as exc:
+        return MeetingSummaryResponse(
+            overall_summary=f"Meeting summary unavailable due to error: {str(exc)}",
+            key_points=[],
+            action_items=[],
+            decisions=[],
+            total_duration=0.0,
+            speakers=[]
+        )
+
+def summarize_transcript(segments: List[SpeakerSegment]) -> MeetingSummaryResponse:
+    """Main function to summarize a transcript directly without chunking"""
+    if not segments:
+        return MeetingSummaryResponse(
+            overall_summary="No content to summarize",
+            key_points=[],
+            action_items=[],
+            decisions=[],
+            total_duration=0.0,
+            speakers=[]
+        )
+    total_duration = segments[-1].end if segments else 0.0
+    transcript_text = _format_transcript_for_summarization(segments)
+    summary = _summarize_with_gemini(transcript_text)
+    summary.total_duration = total_duration
+    summary.speakers = list(set([seg.speaker for seg in segments]))
+    return summary
+
 
 class TranscribeDiarizeRequest(BaseModel):
     file_path: str
@@ -326,6 +466,58 @@ class TranscribeDiarizeRequest(BaseModel):
 @app.post("/v1/transcribe-diarize-path", response_model=SpeakerTranscriptResponse)
 async def transcribe_diarize_path(request: TranscribeDiarizeRequest):
     return transcribe_diarize_file_path(request.file_path)
+
+
+@app.post("/v1/summarize", response_model=MeetingSummaryResponse)
+async def summarize_audio(file: UploadFile = File(..., description="Audio file to transcribe, diarize, and summarize")):
+    """Complete pipeline: transcribe + diarize + summarize"""
+    if not file.content_type or not any(
+        x in file.content_type for x in ("audio", "video", "octet-stream")
+    ):
+        raise HTTPException(status_code=400, detail="Unsupported file type")
+
+    try:
+        suffix = os.path.splitext(file.filename or "upload")[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            file_bytes = await file.read()
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        transcript_response = transcribe_diarize_file_path(tmp_path)
+        summary_response = summarize_transcript(transcript_response.segments)
+        
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        try:
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return summary_response
+class SummarizeRequest(BaseModel):
+    file_path: str
+
+@app.post("/v1/summarize-path", response_model=MeetingSummaryResponse)
+async def summarize_from_path(request: SummarizeRequest):
+    """Complete pipeline from local file path: transcribe + diarize + summarize"""
+    try:
+        transcript_response = transcribe_diarize_file_path(request.file_path)
+        summary_response = summarize_transcript(transcript_response.segments)
+        return summary_response
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+class SummarizeTranscriptRequest(BaseModel):
+    segments: List[SpeakerSegment]
+
+@app.post("/v1/summarize-transcript", response_model=MeetingSummaryResponse)
+async def summarize_transcript_direct(request: SummarizeTranscriptRequest):
+    """Summarize already processed transcript segments"""
+    try:
+        summary_response = summarize_transcript(request.segments)
+        return summary_response
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 if __name__ == "__main__":
     import uvicorn
